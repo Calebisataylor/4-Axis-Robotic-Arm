@@ -8,7 +8,6 @@ A 4-axis, cable driven, robotic arm, designed and built from scratch to demonstr
 - Motor control
 - Real-time systems integration
 
-- 
 ## Quick Specs
 
 - **Kinematics/Motion:** 4 Degrees of Freedom (Base yaw, shoulder pitch, elbow pitch, wrist pitch) plus an independent 4-finger gripper.

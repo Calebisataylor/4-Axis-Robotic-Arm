@@ -1,3 +1,14 @@
+## **Overview**
+
+A 4-axis, cable driven, robotic arm, designed and built from scratch to demonstrate capabilities in: 
+
+- Embedded systems
+- Circuit design
+- 3D CAD design (fusion 360)
+- Motor control
+- Real-time systems integration
+
+- 
 ## Quick Specs
 
 - **Kinematics/Motion:** 4 Degrees of Freedom (Base yaw, shoulder pitch, elbow pitch, wrist pitch) plus an independent 4-finger gripper.

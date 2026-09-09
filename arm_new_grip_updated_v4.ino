@@ -1,0 +1,975 @@
+#include <Bluepad32.h>
+#include <ESP32Servo.h>
+#include <math.h>
+
+// ============================================================
+// ===== PLAYBACK MOTION
+
+
+const float PLAY_SPEED = 0.8;
+
+
+const float PLAY_ACCEL_TIME_S = 0.35;
+const float PLAY_DECEL_TIME_S = 0.45;
+
+const unsigned long POINT_DWELL_MS = 60;
+
+
+const float CLAW_MAX_DEG_PER_S = 380.0;
+
+
+const int TRIGGER_THRESHOLD = 300;
+
+
+// -- motors ---
+const int DIR_YAW = 23;      const int STEP_YAW = 22;
+const int DIR_SHOULDER = 21; const int STEP_SHOULDER = 19;
+const int DIR_ELBOW = 18;    const int STEP_ELBOW = 5;
+const int DIR_WRIST = 4;     const int STEP_WRIST = 2;
+
+// --- potentiometers ---
+const int POT_YAW = 34;
+const int POT_SHOULDER = 35;
+const int POT_ELBOW = 32;
+const int POT_WRIST = 33;
+
+// --- gripper pins ---
+const int POT_CLAW = 36;   // silkscreened VP - ADC1, input-only
+const int SERVO_CLAW = 25;
+
+// --- yaw axis ---
+const bool YAW_AXIS_BUILT = true;
+const float YAW_STEPS_PER_DEGREE = 266.67; // 200*16*30/360, 30:1 direct drive
+const float YAW_LIMIT_DEG = 90.0;
+
+// ====yaw knob sense
+const float YAW_POT_COUNTS_FOR_LIMIT = 2000.0;   // was effectively ~1460
+const bool INVERT_YAW_DIR = false;
+
+// --directions --
+const bool INVERT_SHOULDER_DIR = true;
+const bool INVERT_ELBOW_DIR = false;
+const bool INVERT_WRIST_DIR = true;
+
+// --- SPEED PROFILES
+const int STEP_DELAY_YAW_US = 134;
+const int STEP_DELAY_SHOULDER_US = 154;
+const int STEP_DELAY_ELBOW_OWN_US = 154;
+const int STEP_DELAY_ELBOW_COMP_US = 154;
+const int STEP_DELAY_ELBOW_REAL_US = 77;
+const int STEP_DELAY_WRIST_OWN_US = 154;
+const int STEP_DELAY_WRIST_COMP_ELBOW_US = 154;
+const int STEP_DELAY_WRIST_COMP_SHOULDER_US = 154;
+const int STEP_DELAY_WRIST_REAL_US = 52;
+
+// --- Elbow's Two Trackers ---
+long targetElbowOwn = 0, targetElbowComp = 0;
+long currentStepsElbowOwn = 0, currentStepsElbowComp = 0;
+unsigned long lastStepElbowOwn = 0, lastStepElbowComp = 0;
+
+// --- Wrist's Three Trackers ---
+long targetWristOwn = 0, targetWristCompElbow = 0, targetWristCompShoulder = 0;
+long currentStepsWristOwn = 0, currentStepsWristCompElbow = 0, currentStepsWristCompShoulder = 0;
+unsigned long lastStepWristOwn = 0, lastStepWristCompElbow = 0, lastStepWristCompShoulder = 0;
+
+// --- Motion Deadband (step-level) ---
+const int MOTION_DEADBAND_STEPS = 12;
+
+const int CENTER_YAW = 2060;
+
+// --- Measured Full-Extent Calibration ---
+const int SHOULDER_POS_EXTREME_POT = 576;
+const int ELBOW_POS_EXTREME_POT = 644;
+const int WRIST_POS_EXTREME_POT = 571;
+
+const float WRIST_STEPS_PER_DEGREE = 94.93;
+
+const float COMP_DIR_SHOULDER = 1.0;
+const float COMP_DIR_ELBOW = 1.0;
+
+float zeroYaw = CENTER_YAW;
+float zeroShoulder = 1934;
+float zeroElbow = 1982;
+float zeroWrist = 2030;
+
+// --- Pot conditioning (v26/v30) ---
+const float FILTER_ALPHA = 0.05;
+float filteredYaw, filteredShoulder, filteredElbow, filteredWrist;
+int histYaw[3], histShoulder[3], histElbow[3], histWrist[3], histClaw[3];
+uint8_t idxYaw = 0, idxShoulder = 0, idxElbow = 0, idxWrist = 0, idxClaw = 0;
+const float POT_DEADBAND = 12.0;
+
+// v3: yaw-only conditioning. ~24 steps per ADC count means the shared
+// values above pass far too much through on this axis. The band is
+// what makes the slave "have to move a bit" before the main arm
+// follows; the slower alpha is what stops it hunting once it does.
+// If yaw now feels laggy, bring ALPHA up toward 0.04 before touching
+// the band - the band is what protects point capture.
+const float YAW_POT_DEADBAND = 40.0;
+const float YAW_FILTER_ALPHA = 0.025;
+
+float lastCommittedYaw = CENTER_YAW;
+float lastCommittedShoulder = 1934;
+float lastCommittedElbow = 1982;
+float lastCommittedWrist = 2030;
+
+// --- Claw (v31: full servo travel) ---
+const float CLAW_POT_MIN = 0.0;
+const float CLAW_POT_MAX = 4095.0;
+const float CLAW_DEG_MIN = 0.0;
+const float CLAW_DEG_MAX = 180.0;
+const bool INVERT_CLAW_POT = false;
+const float CLAW_FILTER_ALPHA = 0.06;
+const float CLAW_POT_DEADBAND = 10.0;
+const unsigned long CLAW_UPDATE_INTERVAL_MS = 15;
+const float CLAW_SLEW_DEG_PER_UPDATE = 5.7;   // live-mode slew
+
+Servo clawServo;
+float filteredClaw = 0;
+float lastCommittedClaw = 0;
+float clawLiveDeg = 0;
+float clawTargetDeg = 0;
+float clawCurrentDeg = 0;
+unsigned long lastClawUpdateTime = 0;
+int rawClawLatest = 0;
+
+// --- Live-mode Accel/Decel Ramp Layer (unchanged) ---
+const unsigned long RAMP_STEP_US = 2;
+const unsigned long DECEL_DISTANCE_STEPS = 400;
+
+const unsigned long YAW_MIN_INTERVAL_US = STEP_DELAY_YAW_US;
+const unsigned long YAW_MAX_INTERVAL_US = 800;
+const unsigned long SHOULDER_MIN_INTERVAL_US = STEP_DELAY_SHOULDER_US;
+const unsigned long SHOULDER_MAX_INTERVAL_US = 920;
+const unsigned long ELBOW_MIN_INTERVAL_US = STEP_DELAY_ELBOW_REAL_US;
+const unsigned long ELBOW_MAX_INTERVAL_US = 460;
+const unsigned long WRIST_MIN_INTERVAL_US = STEP_DELAY_WRIST_REAL_US;
+const unsigned long WRIST_MAX_INTERVAL_US = 308;
+
+unsigned long currentIntervalYaw = YAW_MAX_INTERVAL_US;
+unsigned long currentIntervalShoulder = SHOULDER_MAX_INTERVAL_US;
+unsigned long currentIntervalElbow = ELBOW_MAX_INTERVAL_US;
+unsigned long currentIntervalWrist = WRIST_MAX_INTERVAL_US;
+
+// --- Tracking / Target Variables ---
+long currentStepsYaw = 0, currentStepsShoulder = 0, currentStepsElbow = 0, currentStepsWrist = 0;
+unsigned long lastStepYaw = 0, lastStepShoulder = 0, lastStepElbow = 0, lastStepWrist = 0;
+long targetYaw = 0, targetShoulder = 0, targetElbow = 0, targetWrist = 0;
+
+// --- Timers ---
+unsigned long lastReadTime = 0;
+const unsigned long READ_INTERVAL_US = 2000;
+unsigned long lastPrintTime = 0;
+const unsigned long PRINT_INTERVAL_MS = 500;
+bool telemetryEnabled = true;
+
+// ===== TEACH / PLAYBACK =========================
+
+ControllerPtr myControllers[BP32_MAX_GAMEPADS];
+
+const uint8_t NIMBUS_DPAD_UP = 0x01;
+const uint8_t NIMBUS_DPAD_DOWN = 0x02;
+const uint8_t NIMBUS_DPAD_RIGHT = 0x04;
+const uint8_t NIMBUS_DPAD_LEFT = 0x08;
+
+
+enum ArmMode { MODE_LIVE, MODE_PLAY };
+ArmMode currentMode = MODE_LIVE;
+
+// --- recorded points ---
+const int MAX_POINTS = 50;
+long ptYaw[MAX_POINTS], ptShoulder[MAX_POINTS], ptElbow[MAX_POINTS], ptWrist[MAX_POINTS];
+float ptClaw[MAX_POINTS];
+int pointCount = 0;
+int pointIndex = -1;          // 0-based index of the point we're on / heading to
+bool isCapturing = false;     // A appends points while true
+
+// --- home (informational; set with Y when no points exist) ---
+long homeYaw = 0, homeShoulder = 0, homeElbow = 0, homeWrist = 0;
+float homeClaw = 0;
+bool homeIsSet = false;
+
+// --- active profiled move ---
+enum MoveKind { MOVE_NONE, MOVE_TO_POINT, MOVE_RESYNC };
+enum AfterResync { AFTER_LIVE, AFTER_CAPTURE };
+MoveKind moveKind = MOVE_NONE;
+AfterResync afterResync = AFTER_LIVE;
+int moveTargetIndex = -1;
+unsigned long moveStartUs = 0;
+unsigned long moveDoneMs = 0;      // when the last move finished (for dwell)
+long mvStart[4], mvEnd[4];         // 0=yaw 1=shoulder 2=elbow 3=wrist
+float mvClawStart = 0, mvClawEnd = 0;
+float prof_ta = 0, prof_tc = 0, prof_td = 0, prof_T = 0, prof_vpk = 0;
+
+// --- input latches ---
+bool serialFwd = false, serialRev = false;
+bool prevA = false, prevB = false, prevX = false, prevY = false;
+bool prevDpadUp = false, prevDpadRight = false;
+bool prevResumeCombo = false, prevResetCombo = false;
+bool trigRHeld = false, trigLHeld = false;
+uint8_t lastDpadSeen = 0;
+uint16_t prevButtonsRaw = 0xFFFF;
+uint8_t prevDpadRaw = 0xFF;
+
+void beginResync(AfterResync what);
+void beginMoveToPoint(int idx);
+
+// ============================================================
+void setup() {
+  Serial.setTxBufferSize(1024);
+  Serial.begin(115200);
+
+  pinMode(DIR_YAW, OUTPUT);      pinMode(STEP_YAW, OUTPUT);
+  pinMode(DIR_SHOULDER, OUTPUT); pinMode(STEP_SHOULDER, OUTPUT);
+  pinMode(DIR_ELBOW, OUTPUT);    pinMode(STEP_ELBOW, OUTPUT);
+  pinMode(DIR_WRIST, OUTPUT);    pinMode(STEP_WRIST, OUTPUT);
+
+  pinMode(POT_YAW, INPUT);
+  pinMode(POT_SHOULDER, INPUT);
+  pinMode(POT_ELBOW, INPUT);
+  pinMode(POT_WRIST, INPUT);
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+
+  pinMode(POT_CLAW, INPUT);
+  ESP32PWM::allocateTimer(0);
+  clawServo.setPeriodHertz(50);
+  clawServo.attach(SERVO_CLAW, 500, 2400);
+  initClaw();
+
+  delay(500);
+
+  BP32.setup(&onConnectedController, &onDisconnectedController);
+  Serial.println("Bluepad32 ready - pair/reconnect your Nimbus now if needed.");
+
+  Serial.println("Calibrating zero position from slave arm...");
+  Serial.println("Make sure the main arm AND slave arm are both at your reference pose right now.");
+  calibrateZero();
+
+  Serial.println("Zero captured. Targets start at rest pose -> safe to power the PSU now.");
+
+  // v4: how much yaw you can actually reach from where zero landed. If
+  // one side is much smaller than the other, the slave pot isn't
+  // centered at your reference pose - recenter it mechanically rather
+  // than compensating in software.
+  {
+    float degPerCount = YAW_LIMIT_DEG / YAW_POT_COUNTS_FOR_LIMIT;
+    float reachDown = constrain(zeroYaw * degPerCount, 0, YAW_LIMIT_DEG);
+    float reachUp = constrain((4095.0f - zeroYaw) * degPerCount, 0, YAW_LIMIT_DEG);
+    Serial.print("Yaw: zero="); Serial.print(zeroYaw, 0);
+    Serial.print("  reachable +"); Serial.print(reachDown, 0);
+    Serial.print(" / -"); Serial.print(reachUp, 0);
+    Serial.print(" deg   ("); Serial.print(degPerCount * YAW_STEPS_PER_DEGREE, 1);
+    Serial.println(" steps per ADC count)");
+  }
+  Serial.println("Y=home/goto-1  A=capture  B=stop  R2/L2=play fwd/rev  DpadR=goto-last  DpadDn+A=resume  L1+R1+X=wipe  DpadUp=live");
+  Serial.println("Serial: z=re-zero h=home a=capture b=stop p/o=play fwd/rev u=park e=goto-last c=resume x=wipe l=live t=telemetry");
+}
+
+// ============================================================
+void loop() {
+  unsigned long currentMicros = micros();
+
+  handleSerial();
+
+  // ---------- 1. READ & CALCULATE (every 2ms) ----------
+  static float yawDeg = 0, shoulderDeg = 0, elbowDeg = 0, wristDeg = 0;
+  static int rawYaw = 0, rawShoulder = 0, rawElbow = 0, rawWrist = 0;
+
+  if (currentMicros - lastReadTime >= READ_INTERVAL_US) {
+    rawYaw = analogRead(POT_YAW);
+    rawShoulder = analogRead(POT_SHOULDER);
+    rawElbow = analogRead(POT_ELBOW);
+    rawWrist = analogRead(POT_WRIST);
+
+    conditionPot(rawYaw,      histYaw,      idxYaw,      filteredYaw,      lastCommittedYaw,      YAW_FILTER_ALPHA, YAW_POT_DEADBAND); // v3
+    conditionPot(rawShoulder, histShoulder, idxShoulder, filteredShoulder, lastCommittedShoulder, FILTER_ALPHA, POT_DEADBAND);
+    conditionPot(rawElbow,    histElbow,    idxElbow,    filteredElbow,    lastCommittedElbow,    FILTER_ALPHA, POT_DEADBAND);
+    conditionPot(rawWrist,    histWrist,    idxWrist,    filteredWrist,    lastCommittedWrist,    FILTER_ALPHA, POT_DEADBAND);
+
+    rawClawLatest = analogRead(POT_CLAW);
+    conditionPot(rawClawLatest, histClaw, idxClaw, filteredClaw, lastCommittedClaw, CLAW_FILTER_ALPHA, CLAW_POT_DEADBAND);
+
+    float clawPotForMap = INVERT_CLAW_POT ? (CLAW_POT_MAX - (lastCommittedClaw - CLAW_POT_MIN)) : lastCommittedClaw;
+    clawLiveDeg = mapFloat(clawPotForMap, CLAW_POT_MIN, CLAW_POT_MAX, CLAW_DEG_MIN, CLAW_DEG_MAX);
+    clawLiveDeg = constrain(clawLiveDeg, min(CLAW_DEG_MIN, CLAW_DEG_MAX), max(CLAW_DEG_MIN, CLAW_DEG_MAX));
+
+    if (YAW_AXIS_BUILT) {
+      // v4: single linear slope about the boot zero. Sign kept negative
+      // so the direction is identical to v3 - decreasing pot count is
+      // still positive degrees, and INVERT_YAW_DIR still means what it
+      // meant. Symmetric by construction, no extreme-pot pair to
+      // re-measure.
+      yawDeg = (zeroYaw - lastCommittedYaw) * (YAW_LIMIT_DEG / YAW_POT_COUNTS_FOR_LIMIT);
+      yawDeg = constrain(yawDeg, -YAW_LIMIT_DEG, YAW_LIMIT_DEG);
+      targetYaw = yawDeg * YAW_STEPS_PER_DEGREE;
+    } else {
+      targetYaw = currentStepsYaw;
+    }
+
+    shoulderDeg = mapFloat(lastCommittedShoulder, zeroShoulder, SHOULDER_POS_EXTREME_POT, 5, 95);
+    shoulderDeg = constrain(shoulderDeg, -85, 95);
+
+    elbowDeg = mapFloat(lastCommittedElbow, zeroElbow, ELBOW_POS_EXTREME_POT, 10, 100);
+    elbowDeg = constrain(elbowDeg, -60, 100);
+
+    wristDeg = mapFloat(lastCommittedWrist, zeroWrist, WRIST_POS_EXTREME_POT, 0, 90);
+    wristDeg = constrain(wristDeg, -45, 90);
+
+    targetShoulder = shoulderDeg * 177.77;
+    targetElbowOwn = elbowDeg * 111.11;
+    targetElbowComp = shoulderDeg * 177.77 * COMP_DIR_SHOULDER;
+    targetWristOwn = wristDeg * WRIST_STEPS_PER_DEGREE;
+    targetWristCompElbow = elbowDeg * 111.11 * COMP_DIR_ELBOW;
+    targetWristCompShoulder = shoulderDeg * 177.77 * COMP_DIR_SHOULDER;
+
+    if (millis() - lastPrintTime >= PRINT_INTERVAL_MS) {
+      lastPrintTime = millis();
+      char tbuf[240];
+      snprintf(tbuf, sizeof(tbuf),
+               "YW %4d %6.1f | SH %4d %6.1f | EL %4d %6.1f | WR %4d %6.1f | CL %4d %5.1f | %s%s cap%c pts%d on%d mv%c pad%02X",
+               rawYaw, yawDeg, rawShoulder, shoulderDeg, rawElbow, elbowDeg, rawWrist, wristDeg,
+               rawClawLatest, clawCurrentDeg,
+               (currentMode == MODE_LIVE) ? "LIVE" : "PLAY",
+               (moveKind == MOVE_RESYNC) ? "/sync" : "",
+               isCapturing ? 'Y' : 'N', pointCount, pointIndex + 1,
+               (moveKind != MOVE_NONE) ? 'Y' : 'N', lastDpadSeen);
+      if (telemetryEnabled && Serial.availableForWrite() > (int)strlen(tbuf) + 2) {
+        Serial.println(tbuf);
+      }
+    }
+    lastReadTime = currentMicros;
+  }
+
+  // ---------- 2. INPUT + STATE ----------
+  handleNimbusInput();
+  updateTeachLogic();
+
+  // Virtual trackers always run: they define the live targets that
+  // LIVE mode and RESYNC moves aim at.
+  virtualTrack(targetElbowOwn, currentStepsElbowOwn, lastStepElbowOwn, currentMicros, STEP_DELAY_ELBOW_OWN_US);
+  virtualTrack(targetElbowComp, currentStepsElbowComp, lastStepElbowComp, currentMicros, STEP_DELAY_ELBOW_COMP_US);
+  targetElbow = currentStepsElbowOwn + currentStepsElbowComp;
+
+  virtualTrack(targetWristOwn, currentStepsWristOwn, lastStepWristOwn, currentMicros, STEP_DELAY_WRIST_OWN_US);
+  virtualTrack(targetWristCompElbow, currentStepsWristCompElbow, lastStepWristCompElbow, currentMicros, STEP_DELAY_WRIST_COMP_ELBOW_US);
+  virtualTrack(targetWristCompShoulder, currentStepsWristCompShoulder, lastStepWristCompShoulder, currentMicros, STEP_DELAY_WRIST_COMP_SHOULDER_US);
+  targetWrist = currentStepsWristOwn + currentStepsWristCompElbow + currentStepsWristCompShoulder;
+
+  // ---------- 3. MOTION ----------
+  if (currentMode == MODE_LIVE) {
+    clawTargetDeg = clawLiveDeg;
+    updateClawLive();
+
+    stepMotor(targetYaw, currentStepsYaw, lastStepYaw, DIR_YAW, STEP_YAW, currentMicros,
+              YAW_MIN_INTERVAL_US, YAW_MAX_INTERVAL_US, DECEL_DISTANCE_STEPS, currentIntervalYaw, INVERT_YAW_DIR);
+    stepMotor(targetShoulder, currentStepsShoulder, lastStepShoulder, DIR_SHOULDER, STEP_SHOULDER, currentMicros,
+              SHOULDER_MIN_INTERVAL_US, SHOULDER_MAX_INTERVAL_US, DECEL_DISTANCE_STEPS, currentIntervalShoulder, INVERT_SHOULDER_DIR);
+    stepMotor(targetElbow, currentStepsElbow, lastStepElbow, DIR_ELBOW, STEP_ELBOW, currentMicros,
+              ELBOW_MIN_INTERVAL_US, ELBOW_MAX_INTERVAL_US, DECEL_DISTANCE_STEPS, currentIntervalElbow, INVERT_ELBOW_DIR);
+    stepMotor(targetWrist, currentStepsWrist, lastStepWrist, DIR_WRIST, STEP_WRIST, currentMicros,
+              WRIST_MIN_INTERVAL_US, WRIST_MAX_INTERVAL_US, DECEL_DISTANCE_STEPS, currentIntervalWrist, INVERT_WRIST_DIR);
+  } else {
+    // MODE_PLAY: profile module drives everything; parked = hold.
+    if (moveKind != MOVE_NONE) {
+      followProfile(currentMicros);
+    }
+  }
+}
+
+// ============================================================
+// ===== MOTION PROFILE MODULE ================================
+// ============================================================
+
+// Build the shared profile for a move from the current motor positions
+// (and claw angle) to the given endpoints.
+void planMove(long eYaw, long eSh, long eEl, long eWr, float eClaw) {
+  mvStart[0] = currentStepsYaw;      mvEnd[0] = eYaw;
+  mvStart[1] = currentStepsShoulder; mvEnd[1] = eSh;
+  mvStart[2] = currentStepsElbow;    mvEnd[2] = eEl;
+  mvStart[3] = currentStepsWrist;    mvEnd[3] = eWr;
+  mvClawStart = clawCurrentDeg;      mvClawEnd = eClaw;
+
+  // Per-axis speed caps (steps/s), derived from the live cruise intervals.
+  const float cap[4] = {
+    PLAY_SPEED * 1.0e6f / STEP_DELAY_YAW_US,
+    PLAY_SPEED * 1.0e6f / STEP_DELAY_SHOULDER_US,
+    PLAY_SPEED * 1.0e6f / STEP_DELAY_ELBOW_REAL_US,
+    PLAY_SPEED * 1.0e6f / STEP_DELAY_WRIST_REAL_US
+  };
+
+  prof_ta = PLAY_ACCEL_TIME_S;
+  prof_td = PLAY_DECEL_TIME_S;
+  float halfRamps = 0.5f * (prof_ta + prof_td);
+
+  // Cruise time needed so that no axis exceeds its cap:
+  //   peak velocity = D / (tc + (ta+td)/2)  <=  cap
+  //   => tc >= D/cap - (ta+td)/2
+  float tcNeeded = 0;
+  bool anyMotion = false;
+  for (int i = 0; i < 4; i++) {
+    float D = (float)labs(mvEnd[i] - mvStart[i]);
+    if (D > 0) {
+      anyMotion = true;
+      float need = D / cap[i] - halfRamps;
+      if (need > tcNeeded) tcNeeded = need;
+    }
+  }
+  float Dc = fabsf(mvClawEnd - mvClawStart);
+  if (Dc > 0.5f) {
+    anyMotion = true;
+    float need = Dc / CLAW_MAX_DEG_PER_S - halfRamps;
+    if (need > tcNeeded) tcNeeded = need;
+  }
+
+  if (!anyMotion) {
+    prof_ta = prof_td = prof_tc = prof_T = 0;
+    prof_vpk = 0;
+  } else {
+    prof_tc = (tcNeeded > 0) ? tcNeeded : 0;
+    prof_T = prof_ta + prof_tc + prof_td;
+    prof_vpk = 1.0f / (prof_tc + halfRamps);   // normalized peak velocity
+  }
+
+  moveStartUs = micros();
+}
+
+// Normalized position 0..1 at time t. Cosine-shaped accel and decel:
+// velocity ramps as (1 - cos)/2, which has zero slope at both ends of
+// each ramp, so there's no jerk at departure, at cruise entry/exit, or
+// at arrival. The distance covered by each ramp is exactly vpk*t/2 -
+// the same as a linear ramp - which is what keeps the math simple.
+float profileFrac(float t) {
+  if (prof_T <= 0) return 1.0f;
+  if (t <= 0) return 0.0f;
+  if (t >= prof_T) return 1.0f;
+
+  if (t < prof_ta) {
+    return 0.5f * prof_vpk * (t - (prof_ta / (float)M_PI) * sinf((float)M_PI * t / prof_ta));
+  }
+  float pos = 0.5f * prof_vpk * prof_ta;
+  if (t < prof_ta + prof_tc) {
+    return pos + prof_vpk * (t - prof_ta);
+  }
+  pos += prof_vpk * prof_tc;
+  float u = t - prof_ta - prof_tc;
+  return pos + 0.5f * prof_vpk * (u + (prof_td / (float)M_PI) * sinf((float)M_PI * u / prof_td));
+}
+
+// One step toward `desired`, honoring the axis's hardware minimum
+// interval. The profile never asks for more than the cap, so this
+// normally has slack; the interval is a safety floor, not a pacer.
+void stepToward(long desired, long &current, unsigned long &lastStepTime, int dirPin, int stepPin,
+                unsigned long now, unsigned long minIntervalUs, bool invertDir) {
+  if (current == desired) return;
+  if (now - lastStepTime < minIntervalUs) return;
+  bool goingUp = (desired > current);
+  bool dirHigh = invertDir ? !goingUp : goingUp;
+  digitalWrite(dirPin, dirHigh ? HIGH : LOW);
+  if (goingUp) current++; else current--;
+  digitalWrite(stepPin, HIGH);
+  delayMicroseconds(2);
+  digitalWrite(stepPin, LOW);
+  lastStepTime = now;
+}
+
+void followProfile(unsigned long now) {
+  float t = (float)(now - moveStartUs) * 1.0e-6f;
+  float p = profileFrac(t);
+
+  long des[4];
+  for (int i = 0; i < 4; i++) {
+    des[i] = mvStart[i] + lroundf((float)(mvEnd[i] - mvStart[i]) * p);
+  }
+
+  stepToward(des[0], currentStepsYaw,      lastStepYaw,      DIR_YAW,      STEP_YAW,      now, YAW_MIN_INTERVAL_US,      INVERT_YAW_DIR);
+  stepToward(des[1], currentStepsShoulder, lastStepShoulder, DIR_SHOULDER, STEP_SHOULDER, now, SHOULDER_MIN_INTERVAL_US, INVERT_SHOULDER_DIR);
+  stepToward(des[2], currentStepsElbow,    lastStepElbow,    DIR_ELBOW,    STEP_ELBOW,    now, ELBOW_MIN_INTERVAL_US,    INVERT_ELBOW_DIR);
+  stepToward(des[3], currentStepsWrist,    lastStepWrist,    DIR_WRIST,    STEP_WRIST,    now, WRIST_MIN_INTERVAL_US,    INVERT_WRIST_DIR);
+
+  // Claw rides the same profile.
+  if (millis() - lastClawUpdateTime >= CLAW_UPDATE_INTERVAL_MS) {
+    lastClawUpdateTime = millis();
+    clawCurrentDeg = mvClawStart + (mvClawEnd - mvClawStart) * p;
+    clawTargetDeg = clawCurrentDeg;
+    clawServo.write((int)(clawCurrentDeg + 0.5f));
+  }
+
+  // Arrival: profile time elapsed AND every motor at its endpoint.
+  if (t >= prof_T &&
+      currentStepsYaw == mvEnd[0] && currentStepsShoulder == mvEnd[1] &&
+      currentStepsElbow == mvEnd[2] && currentStepsWrist == mvEnd[3]) {
+    clawCurrentDeg = mvClawEnd;
+    clawTargetDeg = mvClawEnd;
+    clawServo.write((int)(clawCurrentDeg + 0.5f));
+    finishMove();
+  }
+}
+
+void finishMove() {
+  MoveKind k = moveKind;
+  moveKind = MOVE_NONE;
+  moveDoneMs = millis();
+
+  if (k == MOVE_TO_POINT) {
+    pointIndex = moveTargetIndex;
+  } else if (k == MOVE_RESYNC) {
+    // Hand the motors back to live tracking with the ramp reset. The
+    // resync aimed at the live targets, so the residual error handed to
+    // stepMotor() is at most a few steps.
+    resetRampToLive();
+    currentMode = MODE_LIVE;
+    if (afterResync == AFTER_CAPTURE) {
+      isCapturing = true;
+      Serial.println("Resynced to slave arm - capturing resumed. Press A to add points, B to stop.");
+    } else {
+      isCapturing = false;
+      Serial.println("Resynced to slave arm - live tracking.");
+    }
+  }
+}
+
+void beginMoveToPoint(int idx) {
+  if (idx < 0 || idx >= pointCount) return;
+  currentMode = MODE_PLAY;
+  isCapturing = false;
+  moveKind = MOVE_TO_POINT;
+  moveTargetIndex = idx;
+  planMove(ptYaw[idx], ptShoulder[idx], ptElbow[idx], ptWrist[idx], ptClaw[idx]);
+}
+
+void beginResync(AfterResync what) {
+  currentMode = MODE_PLAY;   // profile module owns the motors during the move
+  isCapturing = false;
+  moveKind = MOVE_RESYNC;
+  afterResync = what;
+  moveTargetIndex = -1;
+  planMove(targetYaw, targetShoulder, targetElbow, targetWrist, clawLiveDeg);
+}
+
+// ============================================================
+// ===== TEACH LOGIC ==========================================
+// ============================================================
+
+void capturePoint() {
+  if (pointCount >= MAX_POINTS) {
+    Serial.println("Point buffer FULL (50). Press B to stop.");
+    return;
+  }
+  ptYaw[pointCount] = targetYaw;
+  ptShoulder[pointCount] = targetShoulder;
+  ptElbow[pointCount] = targetElbow;
+  ptWrist[pointCount] = targetWrist;
+  ptClaw[pointCount] = clawLiveDeg;
+  pointCount++;
+  pointIndex = pointCount - 1;
+  isCapturing = true;
+  Serial.print("Captured point "); Serial.print(pointCount);
+  Serial.print("  yaw="); Serial.print(ptYaw[pointIndex]);
+  Serial.print(" sh="); Serial.print(ptShoulder[pointIndex]);
+  Serial.print(" el="); Serial.print(ptElbow[pointIndex]);
+  Serial.print(" wr="); Serial.print(ptWrist[pointIndex]);
+  Serial.print(" claw="); Serial.println(ptClaw[pointIndex], 1);
+}
+
+void stopCapture() {
+  if (!isCapturing) { Serial.println("Not capturing."); return; }
+  isCapturing = false;
+  pointIndex = pointCount - 1;
+  Serial.print("Capture stopped - "); Serial.print(pointCount); Serial.println(" points saved.");
+  Serial.println("Hold R2 to play forward, L2 to play backward. D-pad right = go to last point.");
+}
+
+void wipePoints() {
+  pointCount = 0;
+  pointIndex = -1;
+  isCapturing = false;
+  Serial.println("ALL POINTS WIPED. Resyncing to slave arm...");
+  beginResync(AFTER_LIVE);
+}
+
+// Called every loop. Handles the trigger-driven continuous playback.
+void updateTeachLogic() {
+  bool fwd = trigRHeld || serialFwd;
+  bool rev = trigLHeld || serialRev;
+  if (fwd && rev) { fwd = false; rev = false; }   // both = neither
+
+  if (!(fwd || rev)) return;
+  if (isCapturing || pointCount == 0) return;
+  if (moveKind != MOVE_NONE) return;             // wait for the current hop
+  if (millis() - moveDoneMs < POINT_DWELL_MS) return;
+
+  int next;
+  if (pointIndex < 0) {
+    next = fwd ? 0 : pointCount - 1;
+  } else if (fwd) {
+    next = (pointIndex + 1) % pointCount;
+  } else {
+    next = (pointIndex - 1 + pointCount) % pointCount;
+  }
+  beginMoveToPoint(next);
+}
+
+// ============================================================
+// ===== INPUT ================================================
+// ============================================================
+
+void handleSerial() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r' || c == ' ') continue;
+    switch (c) {
+      case 'z':
+        Serial.println("Re-zeroing now...");
+        calibrateZero();
+        break;
+      case 'h': doHomeButton(); break;
+      case 'a': doCaptureButton(); break;
+      case 'b': case 's': stopCapture(); break;
+      case 'p': serialFwd = true;  serialRev = false; Serial.println("Playback FORWARD latched (serial). 'u' to park."); break;
+      case 'o': serialRev = true;  serialFwd = false; Serial.println("Playback BACKWARD latched (serial). 'u' to park."); break;
+      case 'u': serialFwd = serialRev = false; Serial.println("Playback released - parking on current point."); break;
+      case 'e': doGotoLast(); break;
+      case 'c': doResumeCapture(); break;
+      case 'x': doWipe(); break;
+      case 'l': doGoLive(); break;
+      case 't': telemetryEnabled = !telemetryEnabled; Serial.println(telemetryEnabled ? "Telemetry ON" : "Telemetry OFF"); break;
+      case '?': default:
+        Serial.println("z=re-zero h=home a=capture b=stop p/o=play fwd/rev u=park e=goto-last c=resume x=wipe l=live t=telemetry");
+        break;
+    }
+  }
+}
+
+// --- button actions (shared by pad and serial) ---
+
+void doHomeButton() {
+  if (moveKind != MOVE_NONE) return;
+  if (pointCount == 0) {
+    if (currentMode != MODE_LIVE) return;
+    homeYaw = targetYaw; homeShoulder = targetShoulder;
+    homeElbow = targetElbow; homeWrist = targetWrist;
+    homeClaw = clawLiveDeg; homeIsSet = true;
+    Serial.println("HOME set (straight up). Move the slave arm and press A to capture points.");
+  } else {
+    if (isCapturing) { Serial.println("Press B to stop capturing first."); return; }
+    serialFwd = serialRev = false;
+    Serial.println("Moving to point 1...");
+    beginMoveToPoint(0);
+  }
+}
+
+void doCaptureButton() {
+  if (currentMode != MODE_LIVE) { Serial.println("Can't capture during playback. D-pad up to go live, or DpadDn+A on the last point to resume."); return; }
+  if (pointCount > 0 && !isCapturing) { Serial.println("Capture is stopped. DpadDn+A (on the last point) to resume, or L1+R1+X to wipe."); return; }
+  capturePoint();
+}
+
+void doGotoLast() {
+  if (pointCount == 0 || isCapturing || moveKind != MOVE_NONE) return;
+  serialFwd = serialRev = false;
+  Serial.print("Moving to last point ("); Serial.print(pointCount); Serial.println(")...");
+  beginMoveToPoint(pointCount - 1);
+}
+
+void doResumeCapture() {
+  if (pointCount == 0) { Serial.println("Nothing recorded - just press A."); return; }
+  if (isCapturing) return;
+  if (moveKind != MOVE_NONE) return;
+  if (pointIndex != pointCount - 1) {
+    Serial.print("Must be on the last point ("); Serial.print(pointCount);
+    Serial.println(") to resume - press D-pad right first.");
+    return;
+  }
+  serialFwd = serialRev = false;
+  if (currentMode == MODE_LIVE) {
+    isCapturing = true;
+    Serial.println("Capturing resumed. Press A to add points, B to stop.");
+  } else {
+    Serial.println("Resyncing to slave arm, then capturing resumes...");
+    beginResync(AFTER_CAPTURE);
+  }
+}
+
+void doWipe() {
+  serialFwd = serialRev = false;
+  wipePoints();
+}
+
+void doGoLive() {
+  serialFwd = serialRev = false;
+  if (currentMode == MODE_LIVE && moveKind == MOVE_NONE) {
+    isCapturing = false;
+    Serial.println("Already live.");
+    return;
+  }
+  Serial.println("Aborting - resyncing to slave arm...");
+  beginResync(AFTER_LIVE);
+}
+
+// --- Nimbus ---
+
+void onConnectedController(ControllerPtr ctl) {
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (myControllers[i] == nullptr) {
+      Serial.printf("Nimbus connected, slot=%d\n", i);
+      myControllers[i] = ctl;
+      return;
+    }
+  }
+  Serial.println("Nimbus connected but no empty controller slot available");
+}
+
+void onDisconnectedController(ControllerPtr ctl) {
+  for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
+    if (myControllers[i] == ctl) {
+      Serial.printf("Nimbus disconnected, slot=%d\n", i);
+      myControllers[i] = nullptr;
+      break;
+    }
+  }
+}
+
+void handleNimbusInput() {
+  BP32.update();
+  trigRHeld = false; trigLHeld = false;
+
+  ControllerPtr ctl = myControllers[0];
+  if (!(ctl && ctl->isConnected() && ctl->isGamepad())) return;
+
+  bool nowA = ctl->a();
+  bool nowB = ctl->b();
+  bool nowX = ctl->x();
+  bool nowY = ctl->y();
+  bool nowL1 = ctl->l1();
+  bool nowR1 = ctl->r1();
+  uint8_t dpad = ctl->dpad();
+  lastDpadSeen = dpad;
+
+  // Triggers: accept either the digital flag or the analog axis.
+  trigRHeld = ctl->r2() || (ctl->throttle() > TRIGGER_THRESHOLD);
+  trigLHeld = ctl->l2() || (ctl->brake() > TRIGGER_THRESHOLD);
+
+  uint16_t buttonsRaw = ctl->buttons();
+  if (buttonsRaw != prevButtonsRaw || dpad != prevDpadRaw) {
+    char pbuf[120];
+    snprintf(pbuf, sizeof(pbuf), "[PAD] btn=0x%04X dpad=0x%02X a=%d b=%d x=%d y=%d l1=%d r1=%d l2=%d r2=%d thr=%d brk=%d",
+             buttonsRaw, dpad, nowA, nowB, nowX, nowY, nowL1, nowR1, ctl->l2(), ctl->r2(), ctl->throttle(), ctl->brake());
+    if (Serial.availableForWrite() > (int)strlen(pbuf) + 2) {
+      Serial.println(pbuf);
+      prevButtonsRaw = buttonsRaw;
+      prevDpadRaw = dpad;
+    }
+  }
+
+  bool nowDpadUp = dpad & NIMBUS_DPAD_UP;
+  bool nowDpadDown = dpad & NIMBUS_DPAD_DOWN;
+  bool nowDpadRight = dpad & NIMBUS_DPAD_RIGHT;
+
+  bool resumeCombo = nowDpadDown && nowA;
+  bool resetCombo = nowL1 && nowR1 && nowX;
+
+  // Combos are evaluated first so their component buttons don't also
+  // fire their solo actions.
+  if (resetCombo && !prevResetCombo) {
+    doWipe();
+  } else if (resumeCombo && !prevResumeCombo) {
+    doResumeCapture();
+  } else {
+    if (nowY && !prevY) doHomeButton();
+    if (nowA && !prevA && !nowDpadDown) doCaptureButton();
+    if (nowB && !prevB) stopCapture();
+    if (nowDpadRight && !prevDpadRight) doGotoLast();
+    if (nowDpadUp && !prevDpadUp) doGoLive();
+  }
+
+  prevA = nowA; prevB = nowB; prevX = nowX; prevY = nowY;
+  prevDpadUp = nowDpadUp; prevDpadRight = nowDpadRight;
+  prevResumeCombo = resumeCombo; prevResetCombo = resetCombo;
+}
+
+// ============================================================
+// ===== UNCHANGED FROM v31: conditioning, claw, calibration ==
+// ============================================================
+
+int median3(int a, int b, int c) {
+  if (a > b) { int t = a; a = b; b = t; }
+  if (b > c) { int t = b; b = c; c = t; }
+  if (a > b) { int t = a; a = b; b = t; }
+  return b;
+}
+
+void primePot(int *hist, int value) {
+  hist[0] = hist[1] = hist[2] = value;
+}
+
+void conditionPot(int raw, int *hist, uint8_t &idx, float &filtered, float &committed,
+                  float alpha, float band) {
+  hist[idx] = raw;
+  idx = (idx + 1) % 3;
+  float med = (float)median3(hist[0], hist[1], hist[2]);
+  filtered += alpha * (med - filtered);
+  float delta = filtered - committed;
+  if (delta > band) {
+    committed = filtered - band;
+  } else if (delta < -band) {
+    committed = filtered + band;
+  }
+}
+
+void initClaw() {
+  const int SAMPLES = 20;
+  long sum = 0;
+  for (int i = 0; i < SAMPLES; i++) {
+    sum += analogRead(POT_CLAW);
+    delay(5);
+  }
+  filteredClaw = (float)sum / SAMPLES;
+  lastCommittedClaw = filteredClaw;
+  rawClawLatest = (int)filteredClaw;
+  primePot(histClaw, rawClawLatest);
+
+  float clawPotForMap = INVERT_CLAW_POT ? (CLAW_POT_MAX - (lastCommittedClaw - CLAW_POT_MIN)) : lastCommittedClaw;
+  clawLiveDeg = mapFloat(clawPotForMap, CLAW_POT_MIN, CLAW_POT_MAX, CLAW_DEG_MIN, CLAW_DEG_MAX);
+  clawLiveDeg = constrain(clawLiveDeg, min(CLAW_DEG_MIN, CLAW_DEG_MAX), max(CLAW_DEG_MIN, CLAW_DEG_MAX));
+  clawTargetDeg = clawLiveDeg;
+  clawCurrentDeg = clawTargetDeg;
+  clawServo.write((int)(clawCurrentDeg + 0.5));
+  lastClawUpdateTime = millis();
+
+  Serial.print("Claw initialized - pot="); Serial.print(rawClawLatest);
+  Serial.print("  deg="); Serial.println(clawCurrentDeg, 1);
+}
+
+// Live-mode claw: slew-limited follow of the slave pot (v31 behavior).
+void updateClawLive() {
+  if (millis() - lastClawUpdateTime < CLAW_UPDATE_INTERVAL_MS) return;
+  lastClawUpdateTime = millis();
+  float error = clawTargetDeg - clawCurrentDeg;
+  if (fabs(error) < 0.1) return;
+  if (error > CLAW_SLEW_DEG_PER_UPDATE) {
+    clawCurrentDeg += CLAW_SLEW_DEG_PER_UPDATE;
+  } else if (error < -CLAW_SLEW_DEG_PER_UPDATE) {
+    clawCurrentDeg -= CLAW_SLEW_DEG_PER_UPDATE;
+  } else {
+    clawCurrentDeg = clawTargetDeg;
+  }
+  clawServo.write((int)(clawCurrentDeg + 0.5));
+}
+
+void calibrateZero() {
+  const int SAMPLES = 40;
+  long sumYaw = 0, sumShoulder = 0, sumElbow = 0, sumWrist = 0;
+  for (int i = 0; i < SAMPLES; i++) {
+    sumYaw += analogRead(POT_YAW);
+    sumShoulder += analogRead(POT_SHOULDER);
+    sumElbow += analogRead(POT_ELBOW);
+    sumWrist += analogRead(POT_WRIST);
+    delay(5);
+  }
+  zeroYaw = (float)sumYaw / SAMPLES;
+  zeroShoulder = (float)sumShoulder / SAMPLES;
+  zeroElbow = (float)sumElbow / SAMPLES;
+  zeroWrist = (float)sumWrist / SAMPLES;
+
+  filteredYaw = zeroYaw; filteredShoulder = zeroShoulder;
+  filteredElbow = zeroElbow; filteredWrist = zeroWrist;
+  lastCommittedYaw = zeroYaw; lastCommittedShoulder = zeroShoulder;
+  lastCommittedElbow = zeroElbow; lastCommittedWrist = zeroWrist;
+
+  primePot(histYaw, (int)zeroYaw);
+  primePot(histShoulder, (int)zeroShoulder);
+  primePot(histElbow, (int)zeroElbow);
+  primePot(histWrist, (int)zeroWrist);
+  idxYaw = idxShoulder = idxElbow = idxWrist = 0;
+
+  float restShoulderDeg = mapFloat(zeroShoulder, zeroShoulder, SHOULDER_POS_EXTREME_POT, 5, 95);
+  float restElbowDeg = mapFloat(zeroElbow, zeroElbow, ELBOW_POS_EXTREME_POT, 10, 100);
+  float restWristDeg = mapFloat(zeroWrist, zeroWrist, WRIST_POS_EXTREME_POT, 0, 90);
+
+  targetYaw = 0;
+  targetShoulder = restShoulderDeg * 177.77;
+  targetElbowOwn = restElbowDeg * 111.11;
+  targetElbowComp = restShoulderDeg * 177.77 * COMP_DIR_SHOULDER;
+  targetWristOwn = restWristDeg * WRIST_STEPS_PER_DEGREE;
+  targetWristCompElbow = restElbowDeg * 111.11 * COMP_DIR_ELBOW;
+  targetWristCompShoulder = restShoulderDeg * 177.77 * COMP_DIR_SHOULDER;
+
+  currentStepsYaw = targetYaw;
+  currentStepsShoulder = targetShoulder;
+  currentStepsElbowOwn = targetElbowOwn;
+  currentStepsElbowComp = targetElbowComp;
+  currentStepsElbow = targetElbow = currentStepsElbowOwn + currentStepsElbowComp;
+  currentStepsWristOwn = targetWristOwn;
+  currentStepsWristCompElbow = targetWristCompElbow;
+  currentStepsWristCompShoulder = targetWristCompShoulder;
+  currentStepsWrist = targetWrist = currentStepsWristOwn + currentStepsWristCompElbow + currentStepsWristCompShoulder;
+
+  resetRampToLive();
+
+  if (homeIsSet || pointCount > 0) {
+    Serial.println("Re-zero: home and recorded points discarded (step frame moved).");
+  }
+  homeIsSet = false;
+  pointCount = 0;
+  pointIndex = -1;
+  isCapturing = false;
+  moveKind = MOVE_NONE;
+  serialFwd = serialRev = false;
+  currentMode = MODE_LIVE;
+}
+
+void resetRampToLive() {
+  currentIntervalYaw = YAW_MAX_INTERVAL_US;
+  currentIntervalShoulder = SHOULDER_MAX_INTERVAL_US;
+  currentIntervalElbow = ELBOW_MAX_INTERVAL_US;
+  currentIntervalWrist = WRIST_MAX_INTERVAL_US;
+}
+
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+void virtualTrack(long target, long &current, unsigned long &lastStepTime, unsigned long currentMicros, unsigned long stepDelayUs) {
+  if (current != target) {
+    if (currentMicros - lastStepTime >= stepDelayUs) {
+      if (current < target) current++; else current--;
+      lastStepTime = currentMicros;
+    }
+  }
+}
+
+// Live-mode ramped stepper (unchanged).
+void stepMotor(long target, long &current, unsigned long &lastStepTime, int dirPin, int stepPin,
+               unsigned long currentMicros, unsigned long minIntervalUs, unsigned long maxIntervalUs,
+               unsigned long decelDistanceSteps, unsigned long &currentIntervalUs, bool invertDir) {
+  long error = target - current;
+  long absError = abs(error);
+  if (absError <= MOTION_DEADBAND_STEPS) {
+    currentIntervalUs = maxIntervalUs;
+    return;
+  }
+  unsigned long desiredIntervalUs;
+  if (absError >= (long)decelDistanceSteps) {
+    desiredIntervalUs = minIntervalUs;
+  } else {
+    float t = (float)absError / (float)decelDistanceSteps;
+    desiredIntervalUs = maxIntervalUs - (unsigned long)(t * (float)(maxIntervalUs - minIntervalUs));
+  }
+  if (currentMicros - lastStepTime >= currentIntervalUs) {
+    bool goingUp = (error > 0);
+    bool dirHigh = invertDir ? !goingUp : goingUp;
+    digitalWrite(dirPin, dirHigh ? HIGH : LOW);
+    if (goingUp) current++; else current--;
+    digitalWrite(stepPin, HIGH);
+    delayMicroseconds(2);
+    digitalWrite(stepPin, LOW);
+    lastStepTime = currentMicros;
+    if (currentIntervalUs < desiredIntervalUs) {
+      currentIntervalUs = min(currentIntervalUs + RAMP_STEP_US, desiredIntervalUs);
+    } else if (currentIntervalUs > desiredIntervalUs) {
+      currentIntervalUs = max(currentIntervalUs - RAMP_STEP_US, desiredIntervalUs);
+    }
+  }
+}
